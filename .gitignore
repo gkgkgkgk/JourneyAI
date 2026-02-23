@@ -1,0 +1,77 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.eggs/
+
+# Uploads & user data (local blobs)
+uploads/
+data/
+
+# Backend settings (contains runtime config)
+backend/settings.json
+
+# Node / Expo
+node_modules/
+.expo/
+web-build/
+dist/
+*.tsbuildinfo
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.pnp/
+.pnp.js
+
+# Native Expo build artifacts
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+.kotlin/
+/ios/
+/android/
+
+# Metro bundler
+.metro-health-check*
+expo-env.d.ts
+
+# pgAdmin / Docker volumes
+pgadmin_data/
+
+# macOS
+.DS_Store
+*.pem
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Claude Code local config
+.claude/
+
+# Private memoir context (not for public repo)
+SOUL.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

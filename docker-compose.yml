@@ -1,0 +1,40 @@
+services:
+  db:
+    image: ankane/pgvector:latest
+    container_name: journey_db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: gavri
+      POSTGRES_PASSWORD: journey_local_pass
+      POSTGRES_DB: journey_vault
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gavri -d journey_vault"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: journey_brain
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  pgadmin:
+      image: dpage/pgadmin4
+      container_name: journey_pgadmin
+      restart: always
+      environment:
+        PGADMIN_DEFAULT_EMAIL: admin@journey.com
+        PGADMIN_DEFAULT_PASSWORD: journey_admin_pass
+      ports:
+        - "5050:80"
