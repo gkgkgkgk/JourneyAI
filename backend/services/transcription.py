@@ -5,8 +5,9 @@ import tempfile
 from collections.abc import Iterator
 from openai import OpenAI
 from pydub import AudioSegment
+import mammoth
 
-MODEL = "gpt-4o"
+MODEL = "gpt-5"
 
 TRANSCRIBE_PROMPT = (
     "Look at this source. "
@@ -32,6 +33,22 @@ def _system_prompt() -> str:
         return ""
 
 
+def _is_text_file(content_type: str, filename: str) -> bool:
+    return content_type == "text/plain" or filename.lower().endswith(".txt")
+
+
+def _is_docx_file(content_type: str, filename: str) -> bool:
+    return (
+        content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or filename.lower().endswith(".docx")
+    )
+
+
+def _docx_to_markdown(file_bytes: bytes) -> str:
+    result = mammoth.convert_to_markdown(io.BytesIO(file_bytes))
+    return result.value
+
+
 def _client() -> OpenAI:
     api_key = os.environ.get("OPENAI_KEY")
     if not api_key:
@@ -40,14 +57,22 @@ def _client() -> OpenAI:
 
 
 def transcribe(file_path: str, content_type: str, original_filename: str) -> str:
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    # Plain text — just return as-is, no LLM needed
+    if _is_text_file(content_type, original_filename):
+        return file_bytes.decode("utf-8", errors="replace")
+
+    # DOCX — convert to markdown, no LLM needed
+    if _is_docx_file(content_type, original_filename):
+        return _docx_to_markdown(file_bytes)
+
     client = _client()
     sys_prompt = _system_prompt()
 
     # Prepend author context when present (use to help decipher names, places, and dates)
     context_prefix = f"{sys_prompt}\n\n" if sys_prompt else ""
-
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
 
     if content_type.startswith("image/"):
         b64 = base64.b64encode(file_bytes).decode("utf-8")
@@ -162,6 +187,23 @@ def transcribe_stream(
     Yields {"type": "status", "message": ...} and {"type": "token", "text": ...}.
     The caller is responsible for accumulating tokens and persisting the result.
     """
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    # Plain text — no LLM needed, just return the content
+    if _is_text_file(content_type, original_filename):
+        yield {"type": "status", "message": "Reading text file…"}
+        text = file_bytes.decode("utf-8", errors="replace")
+        yield {"type": "token", "text": text}
+        return
+
+    # DOCX — convert to markdown, no LLM needed
+    if _is_docx_file(content_type, original_filename):
+        yield {"type": "status", "message": "Converting DOCX to markdown…"}
+        text = _docx_to_markdown(file_bytes)
+        yield {"type": "token", "text": text}
+        return
+
     client = _client()
     sys_prompt = _system_prompt()
 
@@ -169,9 +211,6 @@ def transcribe_stream(
         f"Context about this archive (use to help decipher names, places, and dates):\n{sys_prompt}\n\n"
         if sys_prompt else ""
     )
-
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
 
     is_audio = content_type.startswith("audio/") or original_filename.lower().endswith(
         (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg")
@@ -184,7 +223,7 @@ def transcribe_stream(
         yield {"type": "token", "text": result}
         return
 
-    yield {"type": "status", "message": "Sending to gpt-4o…"}
+    yield {"type": "status", "message": "Sending to transcription services..."}
 
     if content_type.startswith("image/"):
         b64 = base64.b64encode(file_bytes).decode("utf-8")

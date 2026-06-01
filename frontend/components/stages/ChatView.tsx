@@ -63,6 +63,9 @@ export default function ChatView({ onClose }: { onClose?: () => void }) {
                 if (event.type === 'sources') {
                     accSources = event.sources;
                     setPendingSources(event.sources);
+                } else if (event.type === 'source_added') {
+                    accSources = [...accSources, event.source];
+                    setPendingSources(prev => [...prev, event.source]);
                 } else if (event.type === 'token') {
                     accContent += event.text;
                     setStreamingContent(accContent);

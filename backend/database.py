@@ -16,6 +16,7 @@ def init_db():
     """Enable pgvector, create tables, and idempotently add any new columns."""
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         conn.commit()
 
     # Import here to avoid circular imports at module load time

@@ -1,12 +1,14 @@
 import json
 import os
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from openai import OpenAI
 from services.indexing import embed
+from services.search import hybrid_search
 from routers.settings import _read as read_settings
 
-MODEL = "gpt-4o"
+MODEL = "gpt-4.1-mini"
+TOP_N = 10
+MAX_TOOL_ROUNDS = 5
 
 LENGTH_TARGETS = {
     "short":  "250–350 words",
@@ -37,6 +39,24 @@ NOTE_TYPE_LABELS = {
     "note":    "writing note or reflection",
 }
 
+GET_SOURCE_TEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_source_text",
+        "description": "Fetch the full transcription text of a source from the catalog. Use this when a catalog source's title and summary suggest it contains relevant detail you need.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_id": {
+                    "type": "string",
+                    "description": "The ID of the source to fetch (e.g. 'f99aaa85-2148-4010-aa41-73ddf06ec923').",
+                }
+            },
+            "required": ["source_id"],
+        },
+    },
+}
+
 
 def _client() -> OpenAI:
     api_key = os.environ.get("OPENAI_KEY")
@@ -48,30 +68,41 @@ def _client() -> OpenAI:
 def generate_kickstart(prompt: str, note_type: str, length: str, fmt: str, db: Session) -> dict:
     client = _client()
 
-    # Embed the prompt for vector search
+    # Embed the prompt for hybrid search
     query_embedding = embed(prompt)
     embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-    # Find the most relevant indexed sources
-    rows = db.execute(
-        text("""
-            SELECT id, title, transcription
-            FROM sources
-            WHERE embedding IS NOT NULL AND transcription IS NOT NULL
-            ORDER BY embedding <=> CAST(:embedding AS vector)
-            LIMIT 5
-        """),
-        {"embedding": embedding_str},
-    ).fetchall()
+    # Fetch ALL indexed sources, sorted by hybrid (semantic + text) similarity
+    rows = hybrid_search(db, prompt, embedding_str)
 
-    source_ids = [row.id for row in rows]
-    source_context = ""
-    for row in rows:
+    top_rows = rows[:TOP_N]
+    catalog_rows = rows[TOP_N:]
+
+    # Build a lookup for deferred fetching
+    transcription_by_id = {row.id: row.transcription for row in rows}
+
+    source_ids = [row.id for row in top_rows]
+
+    # Build two-section source context
+    full_section = ""
+    for row in top_rows:
         label = row.title or "Untitled Source"
-        source_context += f"\n\n--- {label} ---\n{row.transcription}"
+        full_section += f"\n\n--- {label} (ID {row.id}) ---\n{row.transcription}"
 
-    if not source_context:
+    catalog_section = ""
+    for row in catalog_rows:
+        label = row.title or "Untitled Source"
+        summary = row.summary or "No summary available."
+        catalog_section += f"\n- [ID {row.id}] {label}: {summary}"
+
+    if not full_section and not catalog_section:
         source_context = "\n\n(No indexed sources available — write from the prompt alone.)"
+    else:
+        source_context = ""
+        if full_section:
+            source_context += f"\n\n=== FULL SOURCES ===\nThese sources are provided in full.{full_section}"
+        if catalog_section:
+            source_context += f"\n\n=== SOURCE CATALOG ===\nThese sources are available by title and summary. Call get_source_text(source_id) to read any of them in full.{catalog_section}"
 
     # Author's manuscript context from settings
     from routers.settings import build_author_context
@@ -90,7 +121,7 @@ Target length: {length_target}
 
 Format: {format_instruction}
 
-Draw on the source materials below. Use specific names, dates, places, and details from the sources wherever relevant. Do not invent facts that are not in the sources. If the sources don't directly address the topic, use them for atmosphere, context, or related detail.
+Draw on the source materials below. Use specific names, dates, places, and details from the sources wherever relevant. Do not invent facts that are not in the sources. If you need more detail from a catalog source, call get_source_text to fetch it before writing.
 
 Return JSON only:
 {{
@@ -100,12 +131,46 @@ Return JSON only:
 
 Source materials:{source_context}"""
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    messages = [{"role": "user", "content": user_prompt}]
+    tools = [GET_SOURCE_TEXT_TOOL] if catalog_rows else None
 
+    # Tool-call loop (max MAX_TOOL_ROUNDS rounds)
+    for _ in range(MAX_TOOL_ROUNDS):
+        kwargs: dict = {
+            "model": MODEL,
+            "response_format": {"type": "json_object"},
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        response = client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+
+        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+            messages.append(choice.message)
+            for tc in choice.message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                sid = args.get("source_id")
+                content = transcription_by_id.get(sid, "Source not found.")
+                if sid and sid not in source_ids:
+                    source_ids.append(sid)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": content,
+                })
+            continue
+
+        # Final response with content
+        data = json.loads(choice.message.content or "{}")
+        return {
+            "title":      data.get("title") or prompt[:60],
+            "content":    data.get("content", ""),
+            "source_ids": source_ids,
+        }
+
+    # Fallback if we hit max rounds — use last response
     data = json.loads(response.choices[0].message.content or "{}")
     return {
         "title":      data.get("title") or prompt[:60],

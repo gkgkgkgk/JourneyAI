@@ -1,17 +1,18 @@
 import json
 import uuid
 import os
+import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from database import get_db
 from models import Source
 from services.transcription import transcribe, transcribe_stream
 from services.indexing import index_source, extract_metadata, embed
+from services.search import hybrid_search
 
 router = APIRouter(prefix="/api/sources", tags=["sources"])
 
@@ -79,24 +80,14 @@ def search_sources(data: SearchRequest, db: Session = Depends(get_db)) -> list[d
     embedding = embed(data.query)
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-    sql = text(
-        """
-        SELECT *, embedding <=> CAST(:embedding AS vector) AS score
-        FROM sources
-        WHERE embedding IS NOT NULL AND transcription IS NOT NULL
-        ORDER BY embedding <=> CAST(:embedding AS vector)
-        LIMIT :limit
-        """
-    )
-    rows = db.execute(sql, {"embedding": embedding_str, "limit": data.limit}).fetchall()
+    rows = hybrid_search(db, data.query, embedding_str, limit=data.limit)
 
     results: list[dict] = []
     for row in rows:
-        from models import Source
         source = db.query(Source).filter(Source.id == row.id).first()
         if source:
             d = _source_dict(source)
-            d["score"] = row.score
+            d["score"] = row.combined_score
             results.append(d)
 
     return results
@@ -298,3 +289,75 @@ def index_source_stream(source_id: str) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/{source_id}/convert-to-audio")
+def convert_video_to_audio(source_id: str, db: Session = Depends(get_db)) -> dict:
+    source = db.query(Source).filter(Source.id == source_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    if not source.content_type.startswith("video/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source is not a video (content_type={source.content_type!r})",
+        )
+
+    # Derive the UUID prefix from the stored video filename so the mp3 is traceable.
+    uuid_prefix = source.stored_filename.split("_")[0]
+    mp3_filename = f"{uuid_prefix}.mp3"
+    mp3_path = os.path.join(UPLOAD_DIR, mp3_filename)
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i", source.file_path,
+                "-vn",
+                "-acodec", "libmp3lame",
+                "-q:a", "2",
+                mp3_path,
+                "-y",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ffmpeg failed: {e.stderr.decode(errors='replace')}",
+        )
+
+    try:
+        mp3_size = os.path.getsize(mp3_path)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not stat output file: {e}")
+
+    # Derive the original audio filename from the video's original filename.
+    video_stem = os.path.splitext(source.original_filename)[0]
+    audio_original_filename = f"{video_stem}.mp3"
+
+    audio_source = Source(
+        id=str(uuid.uuid4()),
+        original_filename=audio_original_filename,
+        stored_filename=mp3_filename,
+        file_path=mp3_path,
+        file_size=mp3_size,
+        content_type="audio/mpeg",
+        uploaded_at=datetime.now(timezone.utc),
+    )
+    db.add(audio_source)
+
+    # Clean up the original video record and file.
+    video_file_path = source.file_path
+    db.delete(source)
+    db.commit()
+
+    try:
+        if os.path.exists(video_file_path):
+            os.remove(video_file_path)
+    except OSError as e:
+        print(f"Warning: could not delete video file {video_file_path}: {e}")
+
+    db.refresh(audio_source)
+    return _source_dict(audio_source)

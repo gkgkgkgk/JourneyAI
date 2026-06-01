@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, Image, Modal, ScrollView, TextInput, Platform } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
-import { UploadCloud, CheckCircle2, Loader2, Info, X, Trash2, ScanText, Edit, DatabaseZap, Users, MapPin, Calendar, Tag, Mic, Save, Check, CheckSquare } from 'lucide-react-native';
+import { UploadCloud, CheckCircle2, Loader2, Info, X, Trash2, ScanText, Edit, DatabaseZap, Users, MapPin, Calendar, Tag, Mic, Save, Check, CheckSquare, Film, FileText } from 'lucide-react-native';
 import AudioPlayer from '@/components/AudioPlayer';
 import { Colors, Fonts } from '@/constants/theme';
 import { useAppColorScheme } from '@/context/JourneyContext';
-import { uploadFile, getSources, deleteSource, updateSource, BASE_URL, streamSSE } from '@/api/client';
+import { uploadFile, getSources, deleteSource, updateSource, BASE_URL, streamSSE, convertToAudio } from '@/api/client';
 
 export default function VaultView() {
   const colorScheme = useAppColorScheme();
@@ -35,6 +35,15 @@ export default function VaultView() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
+  const [bulkDeleteConfirmVisible, setBulkDeleteConfirmVisible] = useState(false);
+  const [convertModalSource, setConvertModalSource] = useState<any>(null);
+  const [pendingFiles, setPendingFiles] = useState<{
+    file: any;
+    isVideo: boolean;
+    transcribe: boolean;
+    index: boolean;
+    convertAudio: boolean;
+  }[] | null>(null);
 
   // Ref for auto-save debounce timer
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -119,47 +128,83 @@ export default function VaultView() {
   const handleUpload = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['image/*', 'application/pdf', 'audio/*'],
+        type: ['image/*', 'application/pdf', 'audio/*', 'video/*', 'text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
         copyToCacheDirectory: true,
         multiple: true,
       });
-
       if (result.canceled) return;
+      setPendingFiles(result.assets.map(file => {
+        const isVideo = (file.mimeType ?? '').startsWith('video/');
+        return { file, isVideo, transcribe: true, index: true, convertAudio: isVideo };
+      }));
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
-      // Push temp placeholders for all selected files immediately
-      const tempEntries = result.assets.map(file => {
-        const tempId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        return { file, tempId };
-      });
+  const handleConfirmUpload = async () => {
+    if (!pendingFiles) return;
+    const files = pendingFiles;
+    setPendingFiles(null);
 
-      setSources(prev => [
-        ...tempEntries.map(({ file, tempId }) => ({
-          ...file,
-          _uploading: true,
-          id: tempId,
-          original_filename: file.name,
-        })),
-        ...prev,
-      ]);
+    const entries = files.map(f => ({
+      ...f,
+      tempId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    }));
 
-      // Fire all uploads in parallel — each updates its own placeholder
-      tempEntries.forEach(({ file, tempId }) => {
+    setSources(prev => [
+      ...entries.map(({ file, tempId }) => ({
+        ...file,
+        _uploading: true,
+        id: tempId,
+        original_filename: file.name,
+      })),
+      ...prev,
+    ]);
+
+    const results = await Promise.allSettled(
+      entries.map(({ file, tempId, transcribe, index, convertAudio, isVideo }) =>
         uploadFile(file)
           .then(uploaded => {
-            const constructedUri = `${BASE_URL as string}/uploads/${uploaded.stored_filename}`;
-            setSources(prev =>
-              prev.map(s => s.id === tempId ? { ...uploaded, uri: constructedUri } : s)
-            );
+            const uri = `${BASE_URL as string}/uploads/${uploaded.stored_filename}`;
+            setSources(prev => prev.map(s => s.id === tempId ? { ...uploaded, uri } : s));
+            return { uploaded: { ...uploaded, uri }, tempId, transcribe, index, convertAudio, isVideo };
           })
           .catch(err => {
             console.error(err);
-            setSources(prev =>
-              prev.map(s => s.id === tempId ? { ...s, _uploading: false, _error: true } : s)
-            );
-          });
-      });
-    } catch (e) {
-      console.error(e);
+            setSources(prev => prev.map(s => s.id === tempId ? { ...s, _uploading: false, _error: true } : s));
+            throw err;
+          })
+      )
+    );
+
+    for (const r of results) {
+      if (r.status === 'rejected') continue;
+      const { uploaded, transcribe, index, convertAudio, isVideo } = r.value;
+      let sourceId = uploaded.id;
+      let canProcess = !isVideo;
+
+      if (isVideo && convertAudio) {
+        setSources(prev => prev.map(s => s.id === sourceId ? { ...s, _converting: true } : s));
+        try {
+          const audio = await convertToAudio(sourceId);
+          const uri = `${BASE_URL as string}/uploads/${audio.stored_filename}`;
+          setSources(prev => prev.map(s => s.id === sourceId ? { ...audio, uri } : s));
+          sourceId = audio.id;
+          canProcess = true;
+        } catch (e) {
+          console.error('Convert failed', e);
+          setSources(prev => prev.map(s => s.id === sourceId ? { ...s, _converting: false, _error: true } : s));
+          continue;
+        }
+      }
+
+      if (canProcess && transcribe) {
+        await handleGenerateTranscription(sourceId);
+      }
+      if (canProcess && transcribe && index) {
+        await handleIndex(sourceId);
+      }
     }
   };
 
@@ -337,6 +382,40 @@ export default function VaultView() {
     setBulkProgress(null);
   };
 
+  const runBulkDelete = async () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    setBulkDeleteConfirmVisible(false);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    for (let i = 0; i < ids.length; i++) {
+      setBulkProgress({ current: i + 1, total: ids.length, label: 'Deleting' });
+      try {
+        await deleteSource(ids[i]);
+        setSources(prev => prev.filter(s => s.id !== ids[i]));
+        if (selectedSourceRef.current?.id === ids[i]) setSelectedSource(null);
+      } catch (e) {
+        console.error('Failed to delete source', ids[i], e);
+      }
+    }
+    setBulkProgress(null);
+  };
+
+  const handleConvertToAudio = async () => {
+    if (!convertModalSource) return;
+    const source = convertModalSource;
+    setConvertModalSource(null);
+    setSources(prev => prev.map(s => s.id === source.id ? { ...s, _converting: true } : s));
+    try {
+      const audioSource = await convertToAudio(source.id);
+      const constructedUri = `${BASE_URL as string}/uploads/${audioSource.stored_filename}`;
+      setSources(prev => prev.map(s => s.id === source.id ? { ...audioSource, uri: constructedUri } : s));
+    } catch (e) {
+      console.error('Convert to audio failed', e);
+      setSources(prev => prev.map(s => s.id === source.id ? { ...s, _converting: false, _error: true } : s));
+    }
+  };
+
   const runBulkIndex = async () => {
     // Only include sources that have a transcription
     const ids = Array.from(selectedIds).filter(id => {
@@ -432,6 +511,18 @@ export default function VaultView() {
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
+              onPress={() => setBulkDeleteConfirmVisible(true)}
+              disabled={selectedIds.size === 0}
+              style={[styles.actionBtn, { backgroundColor: theme.error + '20', opacity: selectedIds.size === 0 ? 0.4 : 1 }]}
+              accessibilityLabel={`Delete ${selectedIds.size} selected sources`}
+              accessibilityRole="button"
+            >
+              <Trash2 size={13} color={theme.error} />
+              <Text style={{ color: theme.error, fontSize: 12, fontWeight: '600' }}>
+                Delete ({selectedIds.size})
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
               onPress={toggleSelectionMode}
               style={styles.actionBtn}
               accessibilityLabel="Cancel selection"
@@ -508,6 +599,10 @@ export default function VaultView() {
                 <View style={[styles.cardPreview, { backgroundColor: theme.background }]}>
                   {item.content_type?.startsWith('audio/') ? (
                     <Mic size={36} color={theme.tint} />
+                  ) : item._converting ? (
+                    <Loader2 size={36} color={theme.secondary} />
+                  ) : item.content_type?.startsWith('video/') ? (
+                    <Film size={36} color={theme.icon} style={{ opacity: 0.4 }} />
                   ) : item.uri ? (
                     <Image source={{ uri: item.uri }} style={styles.thumbnail} />
                   ) : (
@@ -524,6 +619,16 @@ export default function VaultView() {
                       <View style={[styles.statusBadge, { backgroundColor: theme.secondary + '18' }]}>
                         <Loader2 size={10} color={theme.secondary} />
                         <Text style={[styles.statusText, { color: theme.secondary }]}>Uploading</Text>
+                      </View>
+                    ) : item._converting ? (
+                      <View style={[styles.statusBadge, { backgroundColor: theme.secondary + '18' }]}>
+                        <Loader2 size={10} color={theme.secondary} />
+                        <Text style={[styles.statusText, { color: theme.secondary }]}>Converting…</Text>
+                      </View>
+                    ) : item.content_type?.startsWith('video/') ? (
+                      <View style={[styles.statusBadge, { backgroundColor: theme.icon + '14' }]}>
+                        <Film size={10} color={theme.icon} />
+                        <Text style={[styles.statusText, { color: theme.icon }]}>Video</Text>
                       </View>
                     ) : transcribingId === item.id ? (
                       <View style={[styles.statusBadge, { backgroundColor: theme.primary + '18' }]}>
@@ -852,6 +957,187 @@ export default function VaultView() {
         </View>
       </Modal>
 
+      {/* Upload Options Modal */}
+      <Modal
+        transparent
+        visible={!!pendingFiles}
+        animationType="fade"
+        onRequestClose={() => setPendingFiles(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { backgroundColor: theme.card, borderColor: theme.border, width: 520, padding: 0, overflow: 'hidden' }]}>
+            {/* Header */}
+            <View style={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: theme.border }}>
+              <Text style={[styles.modalTitle, { color: theme.text, marginBottom: 0 }]}>
+                Upload {pendingFiles?.length ?? 0} file{(pendingFiles?.length ?? 0) !== 1 ? 's' : ''}
+              </Text>
+            </View>
+
+            {/* File rows */}
+            <ScrollView style={{ maxHeight: 360 }}>
+              {(pendingFiles ?? []).map((f, i) => {
+                const isLast = i === (pendingFiles?.length ?? 0) - 1;
+                const mimeType = f.file.mimeType ?? '';
+                return (
+                  <View
+                    key={i}
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      paddingHorizontal: 20,
+                      paddingVertical: 14,
+                      borderBottomWidth: isLast ? 0 : 1,
+                      borderBottomColor: theme.border,
+                      gap: 14,
+                    }}
+                  >
+                    {/* Thumbnail */}
+                    <View style={{
+                      width: 48, height: 48, borderRadius: 8, overflow: 'hidden',
+                      backgroundColor: theme.background, borderWidth: 1, borderColor: theme.border,
+                      justifyContent: 'center', alignItems: 'center', flexShrink: 0,
+                    }}>
+                      {mimeType.startsWith('image/') && f.file.uri ? (
+                        <Image source={{ uri: f.file.uri }} style={{ width: 48, height: 48 }} resizeMode="cover" />
+                      ) : mimeType.startsWith('audio/') ? (
+                        <Mic size={22} color={theme.tint} />
+                      ) : mimeType.startsWith('video/') ? (
+                        <Film size={22} color={theme.icon} />
+                      ) : (
+                        <FileText size={22} color={theme.icon} />
+                      )}
+                    </View>
+
+                    {/* Filename */}
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text numberOfLines={2} style={{ color: theme.text, fontWeight: '600', fontSize: 13, lineHeight: 18 }}>
+                        {f.file.name}
+                      </Text>
+                      <Text style={{ color: theme.secondary, fontSize: 11, marginTop: 2 }}>
+                        {mimeType || 'Unknown type'}
+                      </Text>
+                    </View>
+
+                    {/* Checkboxes — stacked on right */}
+                    <View style={{ gap: 6, alignItems: 'flex-start', flexShrink: 0 }}>
+                      {f.isVideo && (
+                        <UploadCheckRow
+                          label="Convert to audio"
+                          checked={f.convertAudio}
+                          disabled={false}
+                          theme={theme}
+                          onChange={v => setPendingFiles(prev => prev!.map((p, j) => j === i ? { ...p, convertAudio: v } : p))}
+                        />
+                      )}
+                      {(!f.isVideo || f.convertAudio) && (
+                        <UploadCheckRow
+                          label="Transcribe"
+                          checked={f.transcribe}
+                          disabled={false}
+                          theme={theme}
+                          onChange={v => setPendingFiles(prev => prev!.map((p, j) =>
+                            j === i ? { ...p, transcribe: v, index: v ? p.index : false } : p
+                          ))}
+                        />
+                      )}
+                      {(!f.isVideo || f.convertAudio) && (
+                        <UploadCheckRow
+                          label="Index"
+                          checked={f.index}
+                          disabled={!f.transcribe}
+                          theme={theme}
+                          onChange={v => setPendingFiles(prev => prev!.map((p, j) => j === i ? { ...p, index: v } : p))}
+                        />
+                      )}
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+
+            {/* Footer */}
+            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 10, padding: 16, borderTopWidth: 1, borderTopColor: theme.border }}>
+              <TouchableOpacity
+                onPress={() => setPendingFiles(null)}
+                style={[styles.modalBtn, { backgroundColor: theme.border }]}
+              >
+                <Text style={{ color: theme.text, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleConfirmUpload}
+                style={[styles.modalBtn, { backgroundColor: theme.primary }]}
+              >
+                <Text style={{ color: 'white', fontWeight: 'bold' }}>Upload & Process</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Video → Audio Conversion Modal */}
+      <Modal
+        transparent
+        visible={!!convertModalSource}
+        animationType="fade"
+        onRequestClose={() => setConvertModalSource(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Film size={28} color={theme.icon} style={{ marginBottom: 12, opacity: 0.6 }} />
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Convert to Audio?</Text>
+            <Text style={[styles.modalText, { color: theme.secondary }]}>
+              {convertModalSource?.original_filename}{'\n\n'}
+              Video playback isn't supported yet. Extract the audio track so you can transcribe it?
+            </Text>
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                onPress={() => setConvertModalSource(null)}
+                style={[styles.modalBtn, { backgroundColor: theme.border }]}
+              >
+                <Text style={{ color: theme.text, fontWeight: '600' }}>Keep as Video</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleConvertToAudio}
+                style={[styles.modalBtn, { backgroundColor: theme.tint }]}
+              >
+                <Text style={{ color: 'white', fontWeight: 'bold' }}>Convert to Audio</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Bulk Delete Confirmation Modal */}
+      <Modal
+        transparent
+        visible={bulkDeleteConfirmVisible}
+        animationType="fade"
+        onRequestClose={() => setBulkDeleteConfirmVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Delete {selectedIds.size} Sources?</Text>
+            <Text style={[styles.modalText, { color: theme.secondary }]}>
+              This will permanently delete {selectedIds.size} source{selectedIds.size !== 1 ? 's' : ''}. This cannot be undone.
+            </Text>
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                onPress={() => setBulkDeleteConfirmVisible(false)}
+                style={[styles.modalBtn, { backgroundColor: theme.border }]}
+              >
+                <Text style={{ color: theme.text, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={runBulkDelete}
+                style={[styles.modalBtn, { backgroundColor: theme.error }]}
+              >
+                <Text style={{ color: 'white', fontWeight: 'bold' }}>Delete All</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* Delete Confirmation Modal */}
       <Modal
         transparent
@@ -902,6 +1188,35 @@ function IndexChips({ icon, label, items, color }: { icon: React.ReactNode; labe
         ))}
       </View>
     </View>
+  );
+}
+
+function UploadCheckRow({
+  label, checked, disabled, onChange, theme
+}: {
+  label: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (v: boolean) => void;
+  theme: any;
+}) {
+  return (
+    <TouchableOpacity
+      onPress={() => !disabled && onChange(!checked)}
+      disabled={disabled}
+      style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6, opacity: disabled ? 0.4 : 1 }}
+      accessibilityRole="checkbox"
+    >
+      <View style={{
+        width: 16, height: 16, borderRadius: 3, borderWidth: 1.5,
+        borderColor: checked && !disabled ? theme.primary : theme.border,
+        backgroundColor: checked && !disabled ? theme.primary : 'transparent',
+        justifyContent: 'center', alignItems: 'center',
+      }}>
+        {checked && !disabled && <Check size={10} color="#fff" />}
+      </View>
+      <Text style={{ fontSize: 12, color: theme.text, fontWeight: '500' }}>{label}</Text>
+    </TouchableOpacity>
   );
 }
 

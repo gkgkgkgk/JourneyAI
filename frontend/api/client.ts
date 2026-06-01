@@ -73,6 +73,16 @@ export const deleteSource = async (id: string) => {
     }
 };
 
+export const convertToAudio = async (id: string) => {
+    try {
+        const response = await apiClient.post(`/api/sources/${id}/convert-to-audio`);
+        return response.data;
+    } catch (error) {
+        console.error('Convert to audio failed:', error);
+        throw error;
+    }
+};
+
 export const updateSource = async (id: string, data: any) => {
     try {
         const response = await apiClient.patch(`/api/sources/${id}`, data);
